@@ -3,12 +3,6 @@ package rosedb
 import (
 	"encoding/binary"
 	"errors"
-	"github.com/flower-corp/rosedb/ds/art"
-	"github.com/flower-corp/rosedb/ds/zset"
-	"github.com/flower-corp/rosedb/flock"
-	"github.com/flower-corp/rosedb/logfile"
-	"github.com/flower-corp/rosedb/logger"
-	"github.com/flower-corp/rosedb/util"
 	"io"
 	"io/ioutil"
 	"math"
@@ -22,6 +16,13 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/flower-corp/rosedb/ds/art"
+	"github.com/flower-corp/rosedb/ds/zset"
+	"github.com/flower-corp/rosedb/flock"
+	"github.com/flower-corp/rosedb/logfile"
+	"github.com/flower-corp/rosedb/logger"
+	"github.com/flower-corp/rosedb/util"
 )
 
 var (
@@ -42,6 +43,9 @@ var (
 
 	// ErrWrongIndex index is out of range
 	ErrWrongIndex = errors.New("index is out of range")
+
+	// ErrExpiredKey key is expired
+	ErrExpiredKey = errors.New("key is expired")
 
 	// ErrGCRunning log file gc is running
 	ErrGCRunning = errors.New("log file gc is running, retry later")
@@ -731,6 +735,252 @@ func (db *RoseDB) doRunGC(dataType DataType, specifiedFid int, gcRatio float64) 
 		db.mu.Unlock()
 		// clear discard state.
 		db.discards[dataType].clear(fid)
+	}
+	return nil
+}
+
+// TTL get ttl(time to live) for the given key (any data structure).
+func (db *RoseDB) TTL(key []byte, kType DataType) (int64, error) {
+	var idxTree *art.AdaptiveRadixTree
+	switch kType {
+	case String:
+		idxTree = db.strIndex.idxTree
+		if idxTree == nil {
+			return 0, ErrKeyNotFound
+		}
+		db.strIndex.mu.RLock()
+		defer db.strIndex.mu.RUnlock()
+	case List:
+		idxTree = db.listIndex.trees[string(key)]
+		if idxTree == nil {
+			return 0, ErrKeyNotFound
+		}
+		db.listIndex.mu.RLock()
+		defer db.listIndex.mu.RUnlock()
+	case Hash:
+		idxTree = db.hashIndex.trees[string(key)]
+		if idxTree == nil {
+			return 0, ErrKeyNotFound
+		}
+		db.hashIndex.mu.RLock()
+		defer db.hashIndex.mu.RUnlock()
+	case Set:
+		idxTree = db.setIndex.trees[string(key)]
+		if idxTree == nil {
+			return 0, ErrKeyNotFound
+		}
+		db.setIndex.mu.RLock()
+		defer db.setIndex.mu.RUnlock()
+	case ZSet:
+		idxTree = db.zsetIndex.trees[string(key)]
+		if idxTree == nil {
+			return 0, ErrKeyNotFound
+		}
+		db.zsetIndex.mu.RLock()
+		defer db.zsetIndex.mu.RUnlock()
+	}
+	if kType == Set {
+		members, err := db.sMembers(key)
+		if err != nil {
+			return 0, err
+		}
+
+		for _, mem := range members {
+			if len(mem) == 0 {
+				continue
+			}
+			if err := db.setIndex.murhash.Write(mem); err != nil {
+				return 0, err
+			}
+			sum := db.setIndex.murhash.EncodeSum128()
+			db.setIndex.murhash.Reset()
+
+			node, err := db.getIndexNode(idxTree, sum)
+			if err != nil {
+				return 0, err
+			}
+
+			var ttl int64
+			if node.expiredAt != 0 {
+				ttl = node.expiredAt - time.Now().Unix()
+			}
+			return ttl, nil
+		}
+
+	} else if kType == ZSet {
+
+		members := db.zsetIndex.indexes.ZRange(string(key), 0, -1)
+		for _, mem := range members {
+			v, _ := mem.(string)
+			mem, err := db.getVal(idxTree, []byte(v), ZSet)
+			if err != nil {
+				return 0, err
+			}
+			if len(mem) == 0 {
+				continue
+			}
+			if err := db.zsetIndex.murhash.Write(mem); err != nil {
+				return 0, err
+			}
+			sum := db.zsetIndex.murhash.EncodeSum128()
+			db.zsetIndex.murhash.Reset()
+
+			node, err := db.getIndexNode(idxTree, sum)
+			if err != nil {
+				return 0, err
+			}
+
+			var ttl int64
+			if node.expiredAt != 0 {
+				ttl = node.expiredAt - time.Now().Unix()
+			}
+			return ttl, nil
+		}
+
+	} else {
+		node, err := db.getIndexNode(idxTree, key)
+		if err != nil {
+			return 0, err
+		}
+
+		var ttl int64
+		if node.expiredAt != 0 {
+			ttl = node.expiredAt - time.Now().Unix()
+		}
+		return ttl, nil
+	}
+	return 0, nil
+}
+
+// Expire set the expiration time for the given key (any data structure).
+func (db *RoseDB) Expire(key []byte, duration time.Duration, kType DataType) error {
+	if duration <= 0 {
+		return nil
+	}
+
+	var idxTree *art.AdaptiveRadixTree
+	switch kType {
+	case String:
+		idxTree = db.strIndex.idxTree
+		if idxTree == nil {
+			return ErrKeyNotFound
+		}
+		db.strIndex.mu.Lock()
+		defer db.strIndex.mu.Unlock()
+	case List:
+		idxTree = db.listIndex.trees[string(key)]
+		if idxTree == nil {
+			return ErrKeyNotFound
+		}
+		db.listIndex.mu.Lock()
+		defer db.listIndex.mu.Unlock()
+	case Hash:
+		idxTree = db.hashIndex.trees[string(key)]
+		if idxTree == nil {
+			return ErrKeyNotFound
+		}
+		db.hashIndex.mu.Lock()
+		defer db.hashIndex.mu.Unlock()
+	case Set:
+		idxTree = db.setIndex.trees[string(key)]
+		if idxTree == nil {
+			return ErrKeyNotFound
+		}
+		db.setIndex.mu.Lock()
+		defer db.setIndex.mu.Unlock()
+	case ZSet:
+		idxTree = db.zsetIndex.trees[string(key)]
+		if idxTree == nil {
+			return ErrKeyNotFound
+		}
+		db.zsetIndex.mu.Lock()
+		defer db.zsetIndex.mu.Unlock()
+	}
+	// update value to add expired
+	if kType == Set {
+		members, err := db.sMembers(key)
+		if err != nil {
+			return err
+		}
+
+		for _, mem := range members {
+			if len(mem) == 0 {
+				continue
+			}
+			if err := db.setIndex.murhash.Write(mem); err != nil {
+				return err
+			}
+			sum := db.setIndex.murhash.EncodeSum128()
+			db.setIndex.murhash.Reset()
+
+			expiredAt := time.Now().Add(duration).Unix()
+
+			ent := &logfile.LogEntry{Key: key, Value: mem, ExpiredAt: expiredAt}
+			valuePos, err := db.writeLogEntry(ent, Set)
+			if err != nil {
+				return err
+			}
+			entry := &logfile.LogEntry{Key: sum, Value: mem, ExpiredAt: expiredAt}
+			_, size := logfile.EncodeEntry(ent)
+			valuePos.entrySize = size
+			err = db.updateIndexTree(idxTree, entry, valuePos, true, Set)
+			if err != nil {
+				return err
+			}
+		}
+	} else if kType == ZSet {
+		members := db.zsetIndex.indexes.ZRange(string(key), 0, -1)
+
+		for _, mem := range members {
+			v, _ := mem.(string)
+			mem, err := db.getVal(idxTree, []byte(v), ZSet)
+			if errors.Is(err, ErrExpiredKey) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if len(mem) == 0 {
+				continue
+			}
+			if err := db.zsetIndex.murhash.Write(mem); err != nil {
+				return err
+			}
+			sum := db.zsetIndex.murhash.EncodeSum128()
+			db.zsetIndex.murhash.Reset()
+
+			_, score := db.zsetIndex.indexes.ZScore(string(key), string(sum))
+
+			scoreBuf := []byte(util.Float64ToStr(score))
+			zsetKey := db.encodeKey(key, scoreBuf)
+			expiredAt := time.Now().Add(duration).Unix()
+			entry := &logfile.LogEntry{Key: zsetKey, Value: mem, ExpiredAt: expiredAt}
+			pos, err := db.writeLogEntry(entry, ZSet)
+			if err != nil {
+				return err
+			}
+
+			_, size := logfile.EncodeEntry(entry)
+			pos.entrySize = size
+			ent := &logfile.LogEntry{Key: sum, Value: mem, ExpiredAt: expiredAt}
+			if err := db.updateIndexTree(idxTree, ent, pos, true, ZSet); err != nil {
+				return err
+			}
+			db.zsetIndex.indexes.ZAdd(string(key), score, string(sum))
+		}
+	} else {
+		val, err := db.getVal(idxTree, key, kType)
+		if err != nil {
+			return err
+		}
+
+		expiredAt := time.Now().Add(duration).Unix()
+		entry := &logfile.LogEntry{Key: key, Value: val, ExpiredAt: expiredAt}
+		valuePos, err := db.writeLogEntry(entry, kType)
+		if err != nil {
+			return err
+		}
+		return db.updateIndexTree(idxTree, entry, valuePos, true, kType)
 	}
 	return nil
 }

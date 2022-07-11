@@ -1,6 +1,9 @@
 package rosedb
 
 import (
+	"errors"
+	"time"
+
 	"github.com/flower-corp/rosedb/ds/art"
 	"github.com/flower-corp/rosedb/logfile"
 	"github.com/flower-corp/rosedb/logger"
@@ -107,6 +110,14 @@ func (db *RoseDB) SIsMember(key, member []byte) bool {
 	sum := db.setIndex.murhash.EncodeSum128()
 	db.setIndex.murhash.Reset()
 	node := idxTree.Get(sum)
+	if node == nil {
+		return false
+	}
+	ts := time.Now().Unix()
+	idxNode := node.(*indexNode)
+	if idxNode.expiredAt != 0 && idxNode.expiredAt <= ts {
+		return false
+	}
 	return node != nil
 }
 
@@ -199,6 +210,39 @@ func (db *RoseDB) SUnion(keys ...[]byte) ([][]byte, error) {
 	return unionSet, nil
 }
 
+// GetSetKeys get all stored keys of type Set.
+func (db *RoseDB) GetSetKeys() (keys [][]byte, err error) {
+	db.setIndex.mu.RLock()
+	defer db.setIndex.mu.RUnlock()
+
+	for key, idxTree := range db.setIndex.trees {
+		iterator := idxTree.Iterator()
+		for iterator.HasNext() {
+			node, _ := iterator.Next()
+			if node == nil {
+				continue
+			}
+
+			rawValue := idxTree.Get(node.Key())
+			if rawValue == nil {
+				continue
+			}
+			idxNode, _ := rawValue.(*indexNode)
+			if idxNode == nil {
+				continue
+			}
+
+			ts := time.Now().Unix()
+			if idxNode.expiredAt != 0 && idxNode.expiredAt <= ts {
+				continue
+			}
+			keys = append(keys, []byte(key))
+			break			
+		}
+	}
+	return
+}
+
 func (db *RoseDB) sremInternal(key []byte, member []byte) error {
 	idxTree := db.setIndex.trees[string(key)]
 	if err := db.setIndex.murhash.Write(member); err != nil {
@@ -244,6 +288,9 @@ func (db *RoseDB) sMembers(key []byte) ([][]byte, error) {
 			continue
 		}
 		val, err := db.getVal(idxTree, node.Key(), Set)
+		if errors.Is(err, ErrExpiredKey) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

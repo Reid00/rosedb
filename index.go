@@ -270,7 +270,7 @@ func (db *RoseDB) getVal(idxTree *art.AdaptiveRadixTree,
 
 	ts := time.Now().Unix()
 	if idxNode.expiredAt != 0 && idxNode.expiredAt <= ts {
-		return nil, ErrKeyNotFound
+		return nil, ErrExpiredKey
 	}
 	// In KeyValueMemMode, the value will be stored in memory.
 	// So get the value from the index info.
